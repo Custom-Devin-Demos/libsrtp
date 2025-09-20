@@ -1150,6 +1150,19 @@ static srtp_err_status_t srtp_kdf_clear(srtp_kdf_t *kdf)
 /* Get the base key length corresponding to a given combined key+salt
  * length for the given cipher.
  * TODO: key and salt lengths should be separate fields in the policy.  */
+static srtp_err_status_t srtp_derive_rtp_header_keys(srtp_session_keys_t *session_keys,
+                                                     srtp_kdf_t *kdf);
+
+srtp_err_status_t srtp_stream_init_keys_v3(srtp_session_keys_t *session_keys,
+                                           const srtp_master_key_v3_t *master_key,
+                                           size_t mki_size);
+
+srtp_err_status_t srtp_derive_rtp_keys(srtp_session_keys_t *session_keys,
+                                       srtp_kdf_t *kdf);
+
+srtp_err_status_t srtp_derive_rtcp_keys(srtp_session_keys_t *session_keys,
+                                        srtp_kdf_t *kdf);
+
 static inline size_t base_key_length(const srtp_cipher_type_t *cipher,
                                      size_t key_length)
 {
@@ -1598,6 +1611,355 @@ srtp_err_status_t srtp_stream_init_keys(srtp_session_keys_t *session_keys,
         return srtp_err_status_init_fail;
     }
 
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_stream_init_keys_v3(srtp_session_keys_t *session_keys,
+                                           const srtp_master_key_v3_t *master_key,
+                                           size_t mki_size)
+{
+    srtp_err_status_t stat;
+    srtp_kdf_t kdf;
+    uint8_t tmp_key[MAX_SRTP_KEY_LEN];
+    size_t kdf_keylen = 30;
+
+    /* Validate input parameters */
+    if (!session_keys || !master_key || !master_key->key || !master_key->salt) {
+        return srtp_err_status_bad_param;
+    }
+
+    if (master_key->key_length == 0 || master_key->salt_length == 0) {
+        return srtp_err_status_bad_param;
+    }
+
+    /* Validate cipher compatibility between RTP and RTCP */
+    if (session_keys->rtp_cipher->type->id != session_keys->rtcp_cipher->type->id) {
+        /* Allow specific compatible combinations */
+        bool compatible = false;
+        if ((session_keys->rtp_cipher->type->id == SRTP_AES_GCM_128 ||
+             session_keys->rtp_cipher->type->id == SRTP_AES_GCM_256) &&
+            (session_keys->rtcp_cipher->type->id == SRTP_AES_GCM_128 ||
+             session_keys->rtcp_cipher->type->id == SRTP_AES_GCM_256)) {
+            compatible = true;
+        }
+        if (!compatible) {
+            debug_print(mod_srtp, "Incompatible cipher types between RTP and RTCP", NULL);
+            return srtp_err_status_bad_param;
+        }
+    }
+
+    /* Initialize key limit to maximum value */
+    srtp_key_limit_set(session_keys->limit, 0xffffffffffffLL);
+
+    /* Handle MKI */
+    if (mki_size != 0) {
+        if (master_key->mki_id == NULL) {
+            return srtp_err_status_bad_param;
+        }
+        session_keys->mki_id = srtp_crypto_alloc(mki_size);
+        if (session_keys->mki_id == NULL) {
+            return srtp_err_status_init_fail;
+        }
+        memcpy(session_keys->mki_id, master_key->mki_id, mki_size);
+    } else {
+        session_keys->mki_id = NULL;
+    }
+
+    /* Determine KDF key length based on cipher requirements */
+    size_t rtp_keylen = srtp_cipher_get_key_length(session_keys->rtp_cipher);
+    size_t rtcp_keylen = srtp_cipher_get_key_length(session_keys->rtcp_cipher);
+    
+    if (rtp_keylen > kdf_keylen || rtcp_keylen > kdf_keylen) {
+        kdf_keylen = 46; /* AES-CTR mode is always used for KDF */
+    }
+
+    /* Prepare combined key material for KDF initialization */
+    memset(tmp_key, 0x0, MAX_SRTP_KEY_LEN);
+    memcpy(tmp_key, master_key->key, master_key->key_length);
+    memcpy(tmp_key + master_key->key_length, master_key->salt, master_key->salt_length);
+
+    /* Initialize KDF state */
+#if defined(OPENSSL) && defined(OPENSSL_KDF)
+    stat = srtp_kdf_init(&kdf, tmp_key, master_key->key_length, master_key->salt_length);
+#else
+    stat = srtp_kdf_init(&kdf, tmp_key, kdf_keylen);
+#endif
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Derive RTP keys */
+    stat = srtp_derive_rtp_keys(session_keys, &kdf);
+    if (stat) {
+        srtp_kdf_clear(&kdf);
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return stat;
+    }
+
+    /* Derive RTCP keys */
+    stat = srtp_derive_rtcp_keys(session_keys, &kdf);
+    if (stat) {
+        srtp_kdf_clear(&kdf);
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return stat;
+    }
+
+    /* Clean up */
+    stat = srtp_kdf_clear(&kdf);
+    octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+    if (stat) {
+        return srtp_err_status_init_fail;
+    }
+
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_derive_rtp_keys(srtp_session_keys_t *session_keys,
+                                       srtp_kdf_t *kdf)
+{
+    srtp_err_status_t stat;
+    uint8_t tmp_key[MAX_SRTP_KEY_LEN];
+    size_t rtp_keylen, rtp_base_key_len, rtp_salt_len;
+
+    if (!session_keys || !kdf) {
+        return srtp_err_status_bad_param;
+    }
+
+    rtp_keylen = srtp_cipher_get_key_length(session_keys->rtp_cipher);
+    rtp_base_key_len = base_key_length(session_keys->rtp_cipher->type, rtp_keylen);
+    rtp_salt_len = rtp_keylen - rtp_base_key_len;
+
+    debug_print(mod_srtp, "RTP key len: %zu", rtp_keylen);
+    debug_print(mod_srtp, "RTP base key len: %zu", rtp_base_key_len);
+    debug_print(mod_srtp, "RTP salt len: %zu", rtp_salt_len);
+
+    /* Generate RTP encryption key */
+    stat = srtp_kdf_generate(kdf, label_rtp_encryption, tmp_key, rtp_base_key_len);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+    debug_print(mod_srtp, "RTP cipher key: %s",
+                srtp_octet_string_hex_string(tmp_key, rtp_base_key_len));
+
+    /* Generate RTP salt if needed */
+    if (rtp_salt_len > 0) {
+        debug_print0(mod_srtp, "Generating RTP salt");
+        stat = srtp_kdf_generate(kdf, label_rtp_salt,
+                                tmp_key + rtp_base_key_len, rtp_salt_len);
+        if (stat) {
+            octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+            return srtp_err_status_init_fail;
+        }
+        memcpy(session_keys->salt, tmp_key + rtp_base_key_len, SRTP_AEAD_SALT_LEN);
+        debug_print(mod_srtp, "RTP cipher salt: %s",
+                    srtp_octet_string_hex_string(tmp_key + rtp_base_key_len, rtp_salt_len));
+    }
+
+    /* Initialize RTP cipher */
+    stat = srtp_cipher_init(session_keys->rtp_cipher, tmp_key);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Handle RTP header extension encryption if present */
+    if (session_keys->rtp_xtn_hdr_cipher) {
+        stat = srtp_derive_rtp_header_keys(session_keys, kdf);
+        if (stat) {
+            octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+            return stat;
+        }
+    }
+
+    /* Generate RTP authentication key */
+    stat = srtp_kdf_generate(kdf, label_rtp_msg_auth, tmp_key,
+                            srtp_auth_get_key_length(session_keys->rtp_auth));
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+    debug_print(mod_srtp, "RTP auth key: %s",
+                srtp_octet_string_hex_string(tmp_key,
+                    srtp_auth_get_key_length(session_keys->rtp_auth)));
+
+    /* Initialize RTP auth function */
+    stat = srtp_auth_init(session_keys->rtp_auth, tmp_key);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_derive_rtcp_keys(srtp_session_keys_t *session_keys,
+                                        srtp_kdf_t *kdf)
+{
+    srtp_err_status_t stat;
+    uint8_t tmp_key[MAX_SRTP_KEY_LEN];
+    size_t rtcp_keylen, rtcp_base_key_len, rtcp_salt_len;
+
+    if (!session_keys || !kdf) {
+        return srtp_err_status_bad_param;
+    }
+
+    rtcp_keylen = srtp_cipher_get_key_length(session_keys->rtcp_cipher);
+    rtcp_base_key_len = base_key_length(session_keys->rtcp_cipher->type, rtcp_keylen);
+    rtcp_salt_len = rtcp_keylen - rtcp_base_key_len;
+
+    debug_print(mod_srtp, "RTCP key len: %zu", rtcp_keylen);
+    debug_print(mod_srtp, "RTCP base key len: %zu", rtcp_base_key_len);
+    debug_print(mod_srtp, "RTCP salt len: %zu", rtcp_salt_len);
+
+    /* Generate RTCP encryption key */
+    stat = srtp_kdf_generate(kdf, label_rtcp_encryption, tmp_key, rtcp_base_key_len);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Generate RTCP salt if needed */
+    if (rtcp_salt_len > 0) {
+        debug_print0(mod_srtp, "Generating RTCP salt");
+        stat = srtp_kdf_generate(kdf, label_rtcp_salt,
+                                tmp_key + rtcp_base_key_len, rtcp_salt_len);
+        if (stat) {
+            octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+            return srtp_err_status_init_fail;
+        }
+        memcpy(session_keys->c_salt, tmp_key + rtcp_base_key_len, SRTP_AEAD_SALT_LEN);
+    }
+
+    debug_print(mod_srtp, "RTCP cipher key: %s",
+                srtp_octet_string_hex_string(tmp_key, rtcp_base_key_len));
+    if (rtcp_salt_len > 0) {
+        debug_print(mod_srtp, "RTCP cipher salt: %s",
+                    srtp_octet_string_hex_string(tmp_key + rtcp_base_key_len, rtcp_salt_len));
+    }
+
+    /* Initialize RTCP cipher */
+    stat = srtp_cipher_init(session_keys->rtcp_cipher, tmp_key);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Generate RTCP authentication key */
+    stat = srtp_kdf_generate(kdf, label_rtcp_msg_auth, tmp_key,
+                            srtp_auth_get_key_length(session_keys->rtcp_auth));
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    debug_print(mod_srtp, "RTCP auth key: %s",
+                srtp_octet_string_hex_string(tmp_key,
+                    srtp_auth_get_key_length(session_keys->rtcp_auth)));
+
+    /* Initialize RTCP auth function */
+    stat = srtp_auth_init(session_keys->rtcp_auth, tmp_key);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+    return srtp_err_status_ok;
+}
+
+static srtp_err_status_t srtp_derive_rtp_header_keys(srtp_session_keys_t *session_keys,
+                                                     srtp_kdf_t *kdf)
+{
+    srtp_err_status_t stat;
+    uint8_t tmp_key[MAX_SRTP_KEY_LEN];
+    size_t rtp_keylen, rtp_salt_len;
+    size_t rtp_xtn_hdr_keylen, rtp_xtn_hdr_base_key_len, rtp_xtn_hdr_salt_len;
+    srtp_kdf_t tmp_kdf;
+    srtp_kdf_t *xtn_hdr_kdf;
+
+    rtp_keylen = srtp_cipher_get_key_length(session_keys->rtp_cipher);
+    rtp_salt_len = rtp_keylen - base_key_length(session_keys->rtp_cipher->type, rtp_keylen);
+
+    if (session_keys->rtp_xtn_hdr_cipher->type != session_keys->rtp_cipher->type) {
+        /* Different cipher types - need separate KDF */
+        uint8_t tmp_xtn_hdr_key[MAX_SRTP_KEY_LEN];
+        rtp_xtn_hdr_keylen = srtp_cipher_get_key_length(session_keys->rtp_xtn_hdr_cipher);
+        rtp_xtn_hdr_base_key_len = base_key_length(
+            session_keys->rtp_xtn_hdr_cipher->type, rtp_xtn_hdr_keylen);
+        rtp_xtn_hdr_salt_len = rtp_xtn_hdr_keylen - rtp_xtn_hdr_base_key_len;
+
+        if (rtp_xtn_hdr_salt_len > rtp_salt_len) {
+            switch (session_keys->rtp_cipher->type->id) {
+            case SRTP_AES_GCM_128:
+            case SRTP_AES_GCM_256:
+                rtp_xtn_hdr_salt_len = rtp_salt_len;
+                break;
+            default:
+                return srtp_err_status_bad_param;
+            }
+        }
+
+        /* Initialize separate KDF for header extensions */
+        memset(tmp_xtn_hdr_key, 0x0, MAX_SRTP_KEY_LEN);
+        
+        xtn_hdr_kdf = &tmp_kdf;
+#if defined(OPENSSL) && defined(OPENSSL_KDF)
+        stat = srtp_kdf_init(xtn_hdr_kdf, tmp_xtn_hdr_key,
+                            rtp_xtn_hdr_base_key_len, rtp_xtn_hdr_salt_len);
+#else
+        stat = srtp_kdf_init(xtn_hdr_kdf, tmp_xtn_hdr_key, 46);
+#endif
+        octet_string_set_to_zero(tmp_xtn_hdr_key, MAX_SRTP_KEY_LEN);
+        if (stat) {
+            return srtp_err_status_init_fail;
+        }
+    } else {
+        /* Same cipher type - reuse main KDF */
+        rtp_xtn_hdr_keylen = rtp_keylen;
+        rtp_xtn_hdr_base_key_len = base_key_length(session_keys->rtp_cipher->type, rtp_keylen);
+        rtp_xtn_hdr_salt_len = rtp_salt_len;
+        xtn_hdr_kdf = kdf;
+    }
+
+    /* Generate header extension encryption key */
+    stat = srtp_kdf_generate(xtn_hdr_kdf, label_rtp_header_encryption,
+                            tmp_key, rtp_xtn_hdr_base_key_len);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Generate header extension salt if needed */
+    if (rtp_xtn_hdr_salt_len > 0) {
+        stat = srtp_kdf_generate(xtn_hdr_kdf, label_rtp_header_salt,
+                                tmp_key + rtp_xtn_hdr_base_key_len,
+                                rtp_xtn_hdr_salt_len);
+        if (stat) {
+            octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+            return srtp_err_status_init_fail;
+        }
+    }
+
+    /* Initialize header extension cipher */
+    stat = srtp_cipher_init(session_keys->rtp_xtn_hdr_cipher, tmp_key);
+    if (stat) {
+        octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+        return srtp_err_status_init_fail;
+    }
+
+    /* Clean up separate KDF if used */
+    if (xtn_hdr_kdf != kdf) {
+        stat = srtp_kdf_clear(xtn_hdr_kdf);
+        if (stat) {
+            octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
+            return srtp_err_status_init_fail;
+        }
+    }
+
+    octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
     return srtp_err_status_ok;
 }
 

@@ -302,6 +302,18 @@ typedef struct srtp_master_key_t {
 } srtp_master_key_t;
 
 /**
+ * @brief srtp_master_key_v3_t represents a master key with explicit
+ * key and salt separation for version 3.0 API.
+ */
+typedef struct srtp_master_key_v3_t {
+    uint8_t *key;          /**< Only the key portion */
+    size_t key_length;     /**< Explicit key length */
+    uint8_t *salt;         /**< Separate salt buffer */
+    size_t salt_length;    /**< Explicit salt length */
+    uint8_t *mki_id;       /**< Master Key Identifier (unchanged) */
+} srtp_master_key_v3_t;
+
+/**
  * @brief represents the policy for an SRTP session.
  *
  * A single srtp_policy_t struct represents the policy for a single
@@ -1480,6 +1492,7 @@ srtp_err_status_t srtp_stream_set_roc(srtp_t session,
 srtp_err_status_t srtp_stream_get_roc(srtp_t session,
                                       uint32_t ssrc,
                                       uint32_t *roc);
+
 
 /**
  * @}
